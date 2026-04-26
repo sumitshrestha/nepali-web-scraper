@@ -1,60 +1,41 @@
 # systemd service file for the Nepali comment scraper
 #
-# SETUP INSTRUCTIONS (run these on your VPS / Raspberry Pi):
-# -----------------------------------------------------------
-# 1. Copy both files to your project folder, e.g. /home/pi/scraper/
+# SETUP (run on your VPS after copying this file):
+#   sudo cp scraper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable scraper   # auto-start on boot
+#   sudo systemctl start  scraper   # start now
 #
-# 2. Edit the three placeholders below:
-#      User            — the Linux user to run as (e.g. pi, ubuntu, yourname)
-#      WorkingDirectory — absolute path to your project folder
-#      ExecStart       — absolute path to your python3 + scrap.py
-#
-#    Quick way to find the paths:
-#      $ whoami                     # your username
-#      $ pwd                        # current directory
-#      $ which python3              # python path
-#
-# 3. Install and start the service:
-#      sudo cp scraper.service /etc/systemd/system/
-#      sudo systemctl daemon-reload
-#      sudo systemctl enable scraper   # auto-start on boot
-#      sudo systemctl start  scraper   # start now
-#
-# 4. Useful commands:
-#      sudo systemctl status  scraper        # quick status
-#      sudo journalctl -u scraper -f         # live log (stdout)
-#      tail -f /home/pi/scraper/scraper.log  # file log (more detail)
-#      sudo systemctl stop    scraper        # graceful stop
-#      sudo systemctl restart scraper        # restart
+# Useful commands:
+#   sudo systemctl status  scraper                                         # quick status
+#   sudo journalctl -u scraper -f                                          # live stdout stream
+#   tail -f /home/sumit/project/scrap/youtube-scraper/scraper.log         # detailed file log
+#   sudo systemctl stop    scraper                                         # graceful stop
+#   sudo systemctl restart scraper                                         # restart
 
 [Unit]
 Description=Nepali YouTube Comment Scraper
-# Wait for the network to be up before starting
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-# --- EDIT THESE THREE LINES ---
-User=pi
-WorkingDirectory=/home/pi/scraper
-ExecStart=/usr/bin/python3 /home/pi/scraper/scrap.py
-# ------------------------------
+User=sumit
+WorkingDirectory=/home/sumit/project/scrap/youtube-scraper
+ExecStart=/usr/bin/python3 /home/sumit/project/scrap/youtube-scraper/scrap.py
 
-# Restart automatically if the process crashes (but not if you stop it manually)
+# Restart automatically on crash; not on manual stop
 Restart=on-failure
 RestartSec=30
 
-# Give the process up to 10 seconds to shut down cleanly on SIGTERM
+# Allow up to 10 s for clean shutdown on SIGTERM
 TimeoutStopSec=10
 
-# Pipe stdout + stderr into journald (visible via journalctl)
+# Both stdout and stderr go to journald (journalctl -u scraper -f)
 StandardOutput=journal
 StandardError=journal
-
-# Tag journal entries so you can filter with: journalctl -u scraper
 SyslogIdentifier=nepali-scraper
 
-# Keep the environment clean; load .env manually via python-dotenv (already done in script)
+# Flush Python output immediately so logs appear in real time
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
