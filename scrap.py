@@ -8,38 +8,14 @@ API_KEY = os.getenv("YOUTUBE_API_KEY")
 if not API_KEY:
     raise ValueError("Missing YOUTUBE_API_KEY")
 
-REGION_CODE = "NP"
 TOP_N = 20
-MAX_RESULTS = 100  # Fetch more to filter
+MAX_RESULTS = 50
 
 
-def get_nepali_videos_by_language(youtube):
-    """Search for videos in Nepali language (more likely from Nepali creators)"""
-    request = youtube.search().list(
-        part="id",
-        type="video",
-        relevanceLanguage="ne",  # Nepali language
-        maxResults=MAX_RESULTS,
-        order="viewCount",  # Get most viewed in Nepali language
-    )
-    return request.execute()
-
-
-def get_nepali_videos_by_location(youtube):
-    """Search for videos geolocated in Nepal"""
-    request = youtube.search().list(
-        part="id",
-        type="video",
-        location="28.3949, 84.1240",  # Center of Nepal
-        locationRadius="500km",
-        maxResults=MAX_RESULTS,
-        order="viewCount",
-    )
-    return request.execute()
-
-
-def get_video_details(youtube, video_ids):
-    """Fetch statistics and snippet info for a list of video IDs"""
+def fetch_video_details(youtube, video_ids):
+    """Fetch snippet and statistics for a list of video IDs."""
+    if not video_ids:
+        return []
     all_videos = []
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i : i + 50]
@@ -49,68 +25,85 @@ def get_video_details(youtube, video_ids):
     return all_videos
 
 
-def filter_nepali_content(videos):
-    """Keep videos that likely come from Nepali creators"""
-    nepali_keywords = ["nepali", "nepal", "nepalima", "kathmandu", "पोखरा", "नेपाली"]
+def get_top_commented(videos):
+    """Filter out videos with no comments and return top N by comment count."""
     filtered = []
     for v in videos:
-        title = v["snippet"]["title"].lower()
-        channel = v["snippet"]["channelTitle"].lower()
-        # Check if title or channel mentions Nepal/Nepali
-        if any(kw in title or kw in channel for kw in nepali_keywords):
-            filtered.append(v)
-        # Also keep channel IDs known to be Nepali (you can add more)
-        elif v["snippet"]["channelId"] in [
-            "UC8y3T8s6Kk5Fq_6KjZgXZ5w"
-        ]:  # Example, add real IDs
-            filtered.append(v)
-    return filtered
+        comment_count = int(v["statistics"].get("commentCount", 0))
+        if comment_count > 0:
+            filtered.append(
+                {
+                    "title": v["snippet"]["title"],
+                    "channel": v["snippet"]["channelTitle"],
+                    "video_id": v["id"],
+                    "comment_count": comment_count,
+                    "view_count": int(v["statistics"].get("viewCount", 0)),
+                }
+            )
+    filtered.sort(key=lambda x: x["comment_count"], reverse=True)
+    return filtered[:TOP_N]
 
 
 def main():
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
 
-    print("Searching for Nepali-language videos...")
-    response = get_nepali_videos_by_language(youtube)
+    # --- Attempt 1: Get trending videos in Nepal (Works but includes international content) ---
+    print("Attempting to retrieve Nepal's trending chart...")
+    request = youtube.videos().list(
+        part="id", chart="mostPopular", regionCode="NP", maxResults=MAX_RESULTS
+    )
+    response = request.execute()
+    video_ids = [item["id"] for item in response.get("items", [])]
+
+    if video_ids:
+        print(f"Trending chart returned {len(video_ids)} videos.")
+        videos = fetch_video_details(youtube, video_ids)
+        top_videos = get_top_commented(videos)
+        if top_videos:
+            print_result(top_videos)
+            return
+
+    # --- Fallback: Search for Nepali music videos ---
+    print(
+        "No results from trending chart. Trying targeted keyword + category search..."
+    )
+    request = youtube.search().list(
+        part="id",
+        type="video",
+        q="nepali songs",  # More specific search term
+        regionCode="NP",  # Prioritize results for Nepal
+        videoCategoryId="10",  # Music category
+        maxResults=MAX_RESULTS,
+    )
+    response = request.execute()
     video_ids = [item["id"]["videoId"] for item in response.get("items", [])]
 
     if not video_ids:
-        print("No Nepali language videos found. Trying location search...")
-        response = get_nepali_videos_by_location(youtube)
-        video_ids = [item["id"]["videoId"] for item in response.get("items", [])]
-
-    if not video_ids:
-        print("No videos found. Check API key or try different approach.")
+        print(
+            "No results found from fallback search. Please check your API key and parameters."
+        )
         return
 
-    print(f"Found {len(video_ids)} candidate videos. Fetching details...")
-    videos = get_video_details(youtube, video_ids)
+    print(f"Fallback search returned {len(video_ids)} videos.")
+    videos = fetch_video_details(youtube, video_ids)
+    top_videos = get_top_commented(videos)
 
-    # Filter for actual Nepali content
-    nepali_videos = filter_nepali_content(videos)
-    print(f"After filtering, {len(nepali_videos)} appear to be from Nepali creators.")
-
-    # Sort by comment count
-    for v in nepali_videos:
-        v["comment_count"] = int(v["statistics"].get("commentCount", 0))
-        v["view_count"] = int(v["statistics"].get("viewCount", 0))
-
-    nepali_videos.sort(key=lambda x: x["comment_count"], reverse=True)
-    top = nepali_videos[:TOP_N]
-
-    if not top:
-        print("No Nepali videos with comments found.")
+    if not top_videos:
+        print("No videos with comments found.")
         return
 
+    print_result(top_videos)
+
+
+def print_result(top_videos):
     print(f"\n{'='*80}")
-    print(f"TOP {len(top)} MOST COMMENTED VIDEOS FROM NEPALI CREATORS")
+    print(f"TOP {len(top_videos)} MOST COMMENTED VIDEOS FROM NEPAL")
     print(f"{'='*80}\n")
-
-    for i, v in enumerate(top, 1):
-        print(f"{i}. {v['snippet']['title']}")
-        print(f"   Channel: {v['snippet']['channelTitle']}")
+    for i, v in enumerate(top_videos, 1):
+        print(f"{i}. {v['title']}")
+        print(f"   Channel: {v['channel']}")
         print(f"   Comments: {v['comment_count']:,} | Views: {v['view_count']:,}")
-        print(f"   https://www.youtube.com/watch?v={v['id']}\n")
+        print(f"   https://www.youtube.com/watch?v={v['video_id']}\n")
 
 
 if __name__ == "__main__":
