@@ -2,3 +2,4 @@ google-api-python-client
 python-dotenv
 lingua-language-detector
 backports.zoneinfo; python_version<'3.9'
+	# No additional dependencies required for irc_client.py (uses only standard library)
