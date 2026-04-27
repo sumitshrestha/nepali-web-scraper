@@ -2,21 +2,7 @@
 Nepali Romanized Comment Scraper
 =================================
 Continuously scrapes comments from the most-commented Nepali YouTube videos,
-keeping only comments written in romanized (Latin-script) Nepali.
-
-Filter logic (using lingua-language-detector):
-  • Fully Devanagari comments (zero Latin words)          → discard
-  • Lingua detects ENGLISH with high confidence           → discard
-  • Lingua detects SPANISH with high confidence           → discard
-  • Everything else (Nepali, uncertain, ambiguous)        → KEEP
-    (romanized Nepali is not a lingua language, so it shows up as uncertain;
-     Devanagari-script Nepali is kept because it IS Nepali content —
-     only the script-check above removes purely-Devanagari comments)
-
-All 75 Lingua language models are loaded (requires ~1 GB RAM) so the
-detector has the full comparison set and gives more honest "uncertain"
-results for romanized Nepali rather than being forced to pick between
-a tiny set of languages.
+keeping only comments that pass the Nepali language filter (see lang_filter.py).
 
 Designed for unattended VPS / Raspberry Pi operation:
   • Saves progress after every page so a crash or reboot resumes mid-video.
@@ -32,7 +18,6 @@ Dependencies:
 import os
 import csv
 import json
-import re
 import time
 import logging
 import datetime
@@ -41,7 +26,7 @@ from googleapiclient.errors import HttpError
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
-from lingua import Language, LanguageDetectorBuilder  # pip install lingua-language-detector
+from lang_filter import NepaliFilter
 
 # ---------------------------------------------------------------------------
 # Config
@@ -57,10 +42,8 @@ MAX_RESULTS = 50
 OUTPUT_DIR  = "nepali_comments"
 LOG_FILE    = "scraper.log"
 
-# Confidence threshold: if Lingua's top result for English or Spanish is
-# >= this value we treat the comment as that language and discard it.
-# 0.85 is intentionally strict — we'd rather keep a borderline English
-# comment than accidentally discard a romanized Nepali one.
+# How confident Lingua must be (0–1) before discarding a comment as EN or ES.
+# Raise toward 0.90 to discard more aggressively; lower toward 0.75 to keep more.
 LINGUA_CONFIDENCE_THRESHOLD = 0.85
 
 SEARCH_QUERIES = [
@@ -76,7 +59,7 @@ SEARCH_QUERIES = [
 # Logging — writes to both console and a rotating log file
 # ---------------------------------------------------------------------------
 
-def setup_logging():
+def setup_logging() -> logging.Logger:
     fmt = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -90,8 +73,8 @@ def setup_logging():
     logger.addHandler(ch)
 
     # Rotating file: 5 MB × 3 backups = up to 15 MB of logs
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3,
-                             encoding="utf-8")
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024,
+                             backupCount=3, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -102,105 +85,10 @@ def setup_logging():
 log = setup_logging()
 
 # ---------------------------------------------------------------------------
-# Lingua detector — load ALL 75 languages for maximum accuracy
-# ---------------------------------------------------------------------------
-#
-# With 1.6 GB available RAM this server can comfortably hold all lingua
-# models (~1 GB).  Loading all languages is better than a small subset
-# because Lingua can then say "I genuinely don't know" for romanized Nepali
-# rather than being forced to pick between only 3 choices.  The more
-# languages it has to compare against, the more honest its uncertainty is.
-
-log.info("Loading Lingua language detector (all languages)...")
-_detector = (
-    LanguageDetectorBuilder
-    .from_all_languages()
-    .with_minimum_relative_distance(0.1)  # require at least 10% gap between top-2
-    .build()
-)
-log.info("Lingua detector ready.")
-
-# ---------------------------------------------------------------------------
-# Comment language filter
-# ---------------------------------------------------------------------------
-
-_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
-
-
-def _latin_words(text):
-    """Return Latin-script words only (strips Devanagari first)."""
-    latin_only = _DEVANAGARI_RE.sub(" ", text)
-    return re.findall(r"[a-zA-Z']+", latin_only)
-
-
-def _devanagari_words(text):
-    return _DEVANAGARI_RE.findall(text)
-
-
-def is_romanized_nepali(text):
-    """
-    Return True if the comment should be kept.
-
-    Lingua's job here is ONLY to identify and discard comments that are
-    clearly NOT Nepali (i.e. confidently English or Spanish).  If Lingua
-    says Nepali, or is uncertain, or picks any other language — we keep it.
-
-    Decision pipeline:
-    ┌──────────────────────────────────────────────────────────────────┐
-    │ 1. Empty?                               → DISCARD               │
-    │ 2. Has Devanagari but zero Latin words  → DISCARD               │
-    │    (purely Devanagari script)                                    │
-    │ 3. Zero Latin words (emoji/nums only)   → DISCARD               │
-    │ 4. Strip Devanagari; run Lingua on      → ENGLISH confident      │
-    │    the Latin-only portion                 → DISCARD             │
-    │                                         → SPANISH confident      │
-    │                                           → DISCARD             │
-    │                                         → anything else          │
-    │                                           → KEEP                │
-    └──────────────────────────────────────────────────────────────────┘
-
-    Step 4 operates only on the Latin portion of mixed comments so that
-    a comment like "yo song राम्रो cha bro" is evaluated as "yo song cha bro"
-    — stripping Devanagari before sending to Lingua avoids confusing the
-    detector with a mixed-script input.
-    """
-    stripped = text.strip()
-
-    # 1. Empty
-    if not stripped:
-        return False
-
-    deva  = _devanagari_words(stripped)
-    latin = _latin_words(stripped)
-
-    # 2. Purely Devanagari (no Latin at all) → discard
-    if deva and not latin:
-        return False
-
-    # 3. No Latin letters (emoji/number-only) → discard
-    if not latin:
-        return False
-
-    # 4. Run Lingua on the Latin-only portion
-    latin_text  = " ".join(latin)
-    confidences = _detector.compute_language_confidence_values(latin_text)
-    conf_map    = {result.language: result.value for result in confidences}
-
-    # Only discard if confidently English or Spanish
-    if conf_map.get(Language.ENGLISH, 0) >= LINGUA_CONFIDENCE_THRESHOLD:
-        return False
-    if conf_map.get(Language.SPANISH, 0) >= LINGUA_CONFIDENCE_THRESHOLD:
-        return False
-
-    # Nepali, uncertain, any other language → KEEP
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Quota / rate-limit handling
 # ---------------------------------------------------------------------------
 
-def _seconds_until_quota_reset():
+def _seconds_until_quota_reset() -> float:
     """Google resets quotas at midnight US/Pacific. Return seconds until then + 5 min buffer."""
     try:
         from zoneinfo import ZoneInfo
@@ -214,7 +102,7 @@ def _seconds_until_quota_reset():
     return max(60, (tomorrow_midnight - now_pt).total_seconds())
 
 
-def quota_sleep():
+def quota_sleep() -> None:
     secs = _seconds_until_quota_reset()
     wake = datetime.datetime.now() + datetime.timedelta(seconds=secs)
     log.warning("Daily quota exhausted. Sleeping %.1f h — resuming at %s local time.",
@@ -228,15 +116,15 @@ def quota_sleep():
     log.info("[QUOTA] Resuming scrape now.")
 
 
-def is_quota_error(http_error):
+def is_quota_error(e: HttpError) -> bool:
     try:
-        reason = http_error.error_details[0].get("reason", "")
+        reason = e.error_details[0].get("reason", "")
         if reason in ("quotaExceeded", "dailyLimitExceeded"):
             return True
     except Exception:
         pass
-    msg = str(http_error).lower()
-    return http_error.resp.status in (429, 403) and (
+    msg = str(e).lower()
+    return e.resp.status in (429, 403) and (
         "quota" in msg or "limit" in msg or "rate" in msg
     )
 
@@ -245,11 +133,11 @@ def is_quota_error(http_error):
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _checkpoint_path(video_id):
+def _checkpoint_path(video_id: str) -> str:
     return os.path.join(OUTPUT_DIR, f"{video_id}.checkpoint.json")
 
 
-def load_checkpoint(video_id):
+def load_checkpoint(video_id: str) -> dict:
     path = _checkpoint_path(video_id)
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -257,24 +145,24 @@ def load_checkpoint(video_id):
     return {"next_page_token": None, "pages_done": 0, "comments_kept": 0}
 
 
-def save_checkpoint(video_id, next_page_token, pages_done, comments_kept):
+def save_checkpoint(video_id: str, next_page_token, pages_done: int, comments_kept: int) -> None:
     with open(_checkpoint_path(video_id), "w", encoding="utf-8") as f:
         json.dump({"next_page_token": next_page_token,
                    "pages_done": pages_done,
                    "comments_kept": comments_kept}, f)
 
 
-def clear_checkpoint(video_id):
+def clear_checkpoint(video_id: str) -> None:
     p = _checkpoint_path(video_id)
     if os.path.exists(p):
         os.remove(p)
 
 
-def is_fully_scraped(video_id):
+def is_fully_scraped(video_id: str) -> bool:
     return os.path.exists(os.path.join(OUTPUT_DIR, f"{video_id}.done"))
 
 
-def mark_done(video_id):
+def mark_done(video_id: str) -> None:
     with open(os.path.join(OUTPUT_DIR, f"{video_id}.done"), "w") as f:
         f.write("done")
 
@@ -287,11 +175,11 @@ CSV_FIELDNAMES = ["video_id", "comment_id", "parent_id", "author",
                   "text", "likes", "published_at", "updated_at", "reply_count"]
 
 
-def _csv_path(video_id):
+def _csv_path(video_id: str) -> str:
     return os.path.join(OUTPUT_DIR, f"{video_id}.csv")
 
 
-def append_comments_to_csv(video_id, comments, write_header):
+def append_comments_to_csv(video_id: str, comments: list, write_header: bool) -> None:
     path = _csv_path(video_id)
     with open(path, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
@@ -304,7 +192,7 @@ def append_comments_to_csv(video_id, comments, write_header):
 # Phase 1: collect top Nepali videos
 # ---------------------------------------------------------------------------
 
-def fetch_video_ids_for_query(youtube, query):
+def fetch_video_ids_for_query(youtube, query: str) -> list[str]:
     while True:
         try:
             resp = youtube.search().list(
@@ -320,7 +208,7 @@ def fetch_video_ids_for_query(youtube, query):
                 raise
 
 
-def fetch_video_details(youtube, video_ids):
+def fetch_video_details(youtube, video_ids: list[str]) -> list:
     all_videos = []
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i: i + 50]
@@ -339,7 +227,7 @@ def fetch_video_details(youtube, video_ids):
     return all_videos
 
 
-def is_nepali_video(video):
+def is_nepali_video(video: dict) -> bool:
     snippet      = video.get("snippet", {})
     audio_lang   = snippet.get("defaultAudioLanguage", "")
     default_lang = snippet.get("defaultLanguage", "")
@@ -351,7 +239,7 @@ def is_nepali_video(video):
     return any("\u0900" <= ch <= "\u097f" for ch in combined) or True
 
 
-def collect_nepali_videos(youtube):
+def collect_nepali_videos(youtube) -> list[str]:
     seen, all_ids = set(), []
     for query in SEARCH_QUERIES:
         log.info("Searching: '%s'", query)
@@ -363,7 +251,7 @@ def collect_nepali_videos(youtube):
     return all_ids
 
 
-def get_top_commented(videos):
+def get_top_commented(videos: list) -> list[dict]:
     filtered = []
     for v in videos:
         if not is_nepali_video(v):
@@ -388,7 +276,8 @@ def get_top_commented(videos):
 # Phase 2: scrape comments with checkpointing + quota handling
 # ---------------------------------------------------------------------------
 
-def scrape_video_comments(youtube, video, video_index, total_videos):
+def scrape_video_comments(youtube, video: dict, video_index: int,
+                          total_videos: int, lang_filter: NepaliFilter) -> None:
     vid_id = video["video_id"]
     title  = video["title"]
     short  = title[:55]
@@ -451,7 +340,7 @@ def scrape_video_comments(youtube, video, video_index, total_videos):
             top_snip = thread["snippet"]["topLevelComment"]["snippet"]
             top_text = top_snip.get("textDisplay", "")
             page_total += 1
-            if is_romanized_nepali(top_text):
+            if lang_filter.is_nepali(top_text):
                 page_comments.append({
                     "video_id":     vid_id,
                     "comment_id":   thread["snippet"]["topLevelComment"]["id"],
@@ -470,7 +359,7 @@ def scrape_video_comments(youtube, video, video_index, total_videos):
                 r_snip = reply["snippet"]
                 r_text = r_snip.get("textDisplay", "")
                 page_total += 1
-                if is_romanized_nepali(r_text):
+                if lang_filter.is_nepali(r_text):
                     page_comments.append({
                         "video_id":     vid_id,
                         "comment_id":   reply["id"],
@@ -489,11 +378,11 @@ def scrape_video_comments(youtube, video, video_index, total_videos):
             append_comments_to_csv(vid_id, page_comments, write_header)
             write_header = False
 
-        next_page_token  = resp.get("nextPageToken")
-        pages_done      += 1
-        comments_kept   += len(page_comments)
-        pages_this_session  += 1
-        kept_this_session   += len(page_comments)
+        next_page_token     = resp.get("nextPageToken")
+        pages_done         += 1
+        comments_kept      += len(page_comments)
+        pages_this_session += 1
+        kept_this_session  += len(page_comments)
 
         save_checkpoint(vid_id, next_page_token, pages_done, comments_kept)
 
@@ -522,7 +411,7 @@ def scrape_video_comments(youtube, video, video_index, total_videos):
 # Summary + display
 # ---------------------------------------------------------------------------
 
-def save_summary(top_videos):
+def save_summary(top_videos: list) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, "summary.json")
     with open(path, "w", encoding="utf-8") as f:
@@ -530,7 +419,7 @@ def save_summary(top_videos):
     return path
 
 
-def log_top_videos(top_videos):
+def log_top_videos(top_videos: list) -> None:
     log.info("=" * 70)
     log.info("TOP %d MOST COMMENTED NEPALI VIDEOS", len(top_videos))
     log.info("=" * 70)
@@ -545,12 +434,15 @@ def log_top_videos(top_videos):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     log.info("=" * 70)
     log.info("Nepali Romanized Comment Scraper starting up")
     log.info("Output dir: %s  |  Log: %s  |  Discard-if-EN/ES threshold: %.0f%%",
              OUTPUT_DIR, LOG_FILE, LINGUA_CONFIDENCE_THRESHOLD * 100)
     log.info("=" * 70)
+
+    # Load the language filter once — all scraping reuses the same instance
+    lang_filter = NepaliFilter(threshold=LINGUA_CONFIDENCE_THRESHOLD)
 
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
 
@@ -571,10 +463,10 @@ def main():
     already_done = sum(1 for v in top_videos if is_fully_scraped(v["video_id"]))
     log.info("Phase 3: scraping comments (%d/%d videos already complete).",
              already_done, len(top_videos))
-    log.info("Script auto-pauses on quota exhaustion and resumes next day. Safe to restart.")
+    log.info("Auto-pauses on quota exhaustion and resumes next day. Safe to restart.")
 
     for i, video in enumerate(top_videos, 1):
-        scrape_video_comments(youtube, video, i, len(top_videos))
+        scrape_video_comments(youtube, video, i, len(top_videos), lang_filter)
 
     log.info("All videos processed. Run again to pick up any new comments.")
 
