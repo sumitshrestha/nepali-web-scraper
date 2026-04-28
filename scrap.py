@@ -418,6 +418,46 @@ def clean_comment_text(raw: str) -> str:
     return text.strip()
 
 
+# ---------------------------------------------------------------------------
+# JSON output helpers
+#
+# During scraping we append newline-delimited JSON (JSONL) to <video_id>.jsonl
+# — one comment object per line.  This is crash-safe (plain append, no need to
+# rewrite the whole file on every page).  When a video is fully scraped,
+# finalize_json() reads the JSONL, wraps it into a proper JSON array, writes
+# <video_id>.json, and removes the scratch file.  If the process crashes
+# mid-video the JSONL survives intact and is simply appended to on resume.
+# ---------------------------------------------------------------------------
+
+# Canonical output fields written to every comment object, in stable order.
+# text       — raw API text (may contain HTML entities and <br> tags)
+# text_clean — normalized version suitable for NLP (entities decoded, <br>
+#              expanded to newlines, invisible chars stripped, whitespace
+#              collapsed)
+JSON_FIELDNAMES = [
+    "video_id",
+    "comment_id",
+    "parent_id",
+    "author",
+    "text",
+    "text_clean",
+    "likes",
+    "published_at",
+    "updated_at",
+    "reply_count",
+]
+
+
+def _jsonl_path(video_id: str) -> str:
+    """Path to the crash-safe JSONL scratch file written during scraping."""
+    return os.path.join(OUTPUT_DIR, f"{video_id}.jsonl")
+
+
+def _json_path(video_id: str) -> str:
+    """Path to the final JSON array file produced after a video is fully scraped."""
+    return os.path.join(OUTPUT_DIR, f"{video_id}.json")
+
+
 def append_comments_to_jsonl(video_id: str, comments: list) -> None:
     """Append comment dicts to the JSONL scratch file (one JSON object per line)."""
     path = _jsonl_path(video_id)
@@ -972,6 +1012,9 @@ def main() -> None:
 
     log.info("All videos processed. Run again to pick up any new comments.")
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
