@@ -107,6 +107,11 @@ LOG_FILE = os.getenv("LOG_FILE", "scraper.log")
 # Maximum number of search-result videos fetched per query (API max = 50).
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
 
+# Enable/disable Nepali language filtering during scraping.
+#   true  – keep only romanized/mixed Nepali comments (default)
+#   false – download all comments; filtering deferred to ETL
+FILTER_COMMENTS = os.getenv("FILTER_COMMENTS", "true").strip().lower() in ("true", "1", "yes")
+
 # ---------------------------------------------------------------------------
 # Optional — language filtering
 # ---------------------------------------------------------------------------
@@ -294,7 +299,6 @@ def transient_backoff(attempt: int, context: str) -> None:
     scrapers from re-colliding on the API at exactly the same instant.
     """
     import random
-
     delay = min(RATE_LIMIT_BASE_WAIT * (2**attempt), RATE_LIMIT_MAX_WAIT)
     jitter = delay * random.uniform(-0.1, 0.1)
     total = delay + jitter
@@ -311,7 +315,6 @@ def transient_backoff(attempt: int, context: str) -> None:
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
-
 
 def _checkpoint_path(video_id: str) -> str:
     return os.path.join(OUTPUT_DIR, f"{video_id}.checkpoint.json")
@@ -500,7 +503,6 @@ def finalize_json(video_id: str) -> str:
 # Phase 1: collect top Nepali videos
 # ---------------------------------------------------------------------------
 
-
 def _api_call_with_retry(call, context: str):
     """
     Execute a single YouTube API callable with unified error handling.
@@ -675,7 +677,7 @@ def build_video_stubs(youtube, video_ids: list[str]) -> list[dict]:
 
 
 def scrape_video_comments(
-    youtube, video: dict, video_index: int, total_videos: int, lang_filter: NepaliFilter
+    youtube, video: dict, video_index: int, total_videos: int, lang_filter
 ) -> None:
     vid_id = video["video_id"]
     title = video["title"]
@@ -768,7 +770,9 @@ def scrape_video_comments(
             top_snip = thread["snippet"]["topLevelComment"]["snippet"]
             top_text = top_snip.get("textDisplay", "")
             page_total += 1
-            if lang_filter.is_nepali(top_text):
+
+            # Keep comment if filtering is OFF or it passes the Nepali check
+            if not FILTER_COMMENTS or (lang_filter and lang_filter.is_nepali(top_text)):
                 page_comments.append(
                     {
                         "video_id": vid_id,
@@ -776,8 +780,6 @@ def scrape_video_comments(
                         "parent_id": "",
                         "author": top_snip.get("authorDisplayName", ""),
                         "text": top_text,
-                        # Normalized version: entities decoded, <br> expanded,
-                        # invisible chars removed, whitespace collapsed.
                         "text_clean": clean_comment_text(top_text),
                         "likes": top_snip.get("likeCount", 0),
                         "published_at": top_snip.get("publishedAt", ""),
@@ -792,7 +794,7 @@ def scrape_video_comments(
                 r_snip = reply["snippet"]
                 r_text = r_snip.get("textDisplay", "")
                 page_total += 1
-                if lang_filter.is_nepali(r_text):
+                if not FILTER_COMMENTS or (lang_filter and lang_filter.is_nepali(r_text)):
                     page_comments.append(
                         {
                             "video_id": vid_id,
@@ -870,7 +872,6 @@ def scrape_video_comments(
 # Summary + display
 # ---------------------------------------------------------------------------
 
-
 def save_summary(top_videos: list) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, "summary.json")
@@ -898,23 +899,13 @@ def log_top_videos(top_videos: list) -> None:
 # CLI argument parsing
 # ---------------------------------------------------------------------------
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Nepali Romanized Comment Scraper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Video selection:
-  By default the scraper discovers the top %(TOP_N)d most-commented Nepali
-  videos automatically.  To scrape specific videos instead, supply their IDs:
-
-    python scrap.py --videos dQw4w9WgXcQ abc123 xyz789
-
-  You can also set the VIDEO_IDS environment variable (comma-separated):
-
-    VIDEO_IDS="dQw4w9WgXcQ,abc123" python scrap.py
-        """
-        % {"TOP_N": TOP_N},
+        epilog="""Video selection examples:
+  python scrap.py --videos dQw4w9WgXcQ abc123
+  VIDEO_IDS="dQw4w9WgXcQ,abc123" python scrap.py""",
     )
     parser.add_argument(
         "--videos",
@@ -939,52 +930,53 @@ def resolve_video_ids(args: argparse.Namespace) -> list[str] | None:
     env_val = os.getenv("VIDEO_IDS", "").strip()
     if env_val:
         ids = [v.strip() for v in env_val.split(",") if v.strip()]
-        log.info(
-            "Manual mode: %d video ID(s) supplied via VIDEO_IDS env var.", len(ids)
-        )
+        log.info("Manual mode: %d video ID(s) supplied via VIDEO_IDS env var.", len(ids))
         return ids
 
-    return None  # fall through to auto-discovery
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
 def main() -> None:
     args = parse_args()
 
     log.info("=" * 70)
     log.info("Nepali Romanized Comment Scraper starting up")
-    log.info(
-        "Output dir: %s  |  Log: %s  |  Discard-if-EN/ES threshold: %.0f%%",
-        OUTPUT_DIR,
-        LOG_FILE,
-        LINGUA_CONFIDENCE_THRESHOLD * 100,
-    )
+    if FILTER_COMMENTS:
+        log.info(
+            "Output dir: %s  |  Log: %s  |  Discard-if-EN/ES threshold: %.0f%%",
+            OUTPUT_DIR,
+            LOG_FILE,
+            LINGUA_CONFIDENCE_THRESHOLD * 100,
+        )
+    else:
+        log.info(
+            "Output dir: %s  |  Log: %s  |  Filtering DISABLED (downloading all comments)",
+            OUTPUT_DIR,
+            LOG_FILE,
+        )
     log.info("=" * 70)
 
-    # Load the language filter once — all scraping reuses the same instance
-    lang_filter = NepaliFilter(threshold=LINGUA_CONFIDENCE_THRESHOLD)
+    # Load language filter only when filtering is enabled (saves ~1 GB RAM)
+    if FILTER_COMMENTS:
+        lang_filter = NepaliFilter(threshold=LINGUA_CONFIDENCE_THRESHOLD)
+    else:
+        lang_filter = None
 
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
 
     explicit_ids = resolve_video_ids(args)
 
     if explicit_ids:
-        # ── Manual mode: skip search, fetch details for the given IDs ──────
-        log.info(
-            "Fetching video details for %d explicit video ID(s)...", len(explicit_ids)
-        )
+        log.info("Fetching video details for %d explicit video ID(s)...", len(explicit_ids))
         top_videos = build_video_stubs(youtube, explicit_ids)
         if not top_videos:
-            log.error(
-                "Could not retrieve details for any of the supplied video IDs. Exiting."
-            )
+            log.error("Could not retrieve details for any of the supplied video IDs. Exiting.")
             return
     else:
-        # ── Auto-discovery mode: search → rank → top N ────────────────────
         log.info("Phase 1: collecting Nepali video IDs...")
         all_video_ids = collect_nepali_videos(youtube)
 
@@ -1011,13 +1003,6 @@ def main() -> None:
         scrape_video_comments(youtube, video, i, len(top_videos), lang_filter)
 
     log.info("All videos processed. Run again to pick up any new comments.")
-
-
-if __name__ == "__main__":
-    main()
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
