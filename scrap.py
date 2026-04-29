@@ -110,7 +110,11 @@ MAX_RESULTS = int(os.getenv("MAX_RESULTS", "50"))
 # Enable/disable Nepali language filtering during scraping.
 #   true  – keep only romanized/mixed Nepali comments (default)
 #   false – download all comments; filtering deferred to ETL
-FILTER_COMMENTS = os.getenv("FILTER_COMMENTS", "true").strip().lower() in ("true", "1", "yes")
+FILTER_COMMENTS = os.getenv("FILTER_COMMENTS", "true").strip().lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # ---------------------------------------------------------------------------
 # Optional — language filtering
@@ -299,6 +303,7 @@ def transient_backoff(attempt: int, context: str) -> None:
     scrapers from re-colliding on the API at exactly the same instant.
     """
     import random
+
     delay = min(RATE_LIMIT_BASE_WAIT * (2**attempt), RATE_LIMIT_MAX_WAIT)
     jitter = delay * random.uniform(-0.1, 0.1)
     total = delay + jitter
@@ -315,6 +320,7 @@ def transient_backoff(attempt: int, context: str) -> None:
 # ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
+
 
 def _checkpoint_path(video_id: str) -> str:
     return os.path.join(OUTPUT_DIR, f"{video_id}.checkpoint.json")
@@ -378,7 +384,7 @@ def mark_done(video_id: str) -> None:
 
 # Characters to strip: zero-width space, zero-width non-joiner, BOM,
 # soft hyphen, and other invisible Unicode formatting characters.
-_INVISIBLE_CHARS_RE = re.compile(r"[​‌‍‎‏﻿­  ]")
+_INVISIBLE_CHARS_RE = re.compile(r"[​‌‍‎‏﻿­]")
 
 # Collapse any run of whitespace (spaces, tabs, form-feeds) — but NOT newlines
 # — into a single space.  Newlines are preserved because they carry structure
@@ -502,6 +508,7 @@ def finalize_json(video_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Phase 1: collect top Nepali videos
 # ---------------------------------------------------------------------------
+
 
 def _api_call_with_retry(call, context: str):
     """
@@ -631,11 +638,13 @@ def get_top_commented(videos: list) -> list[dict]:
             {
                 "title": v["snippet"]["title"],
                 "channel": v["snippet"]["channelTitle"],
+                "channel_id": v["snippet"]["channelId"],  # ← added
                 "video_id": v["id"],
                 "comment_count": cc,
                 "view_count": int(v["statistics"].get("viewCount", 0)),
                 "language": v["snippet"].get("defaultAudioLanguage")
                 or v["snippet"].get("defaultLanguage", "untagged"),
+                "published_at": v["snippet"].get("publishedAt"),  # ← added
             }
         )
     filtered.sort(key=lambda x: x["comment_count"], reverse=True)
@@ -658,14 +667,15 @@ def build_video_stubs(youtube, video_ids: list[str]) -> list[dict]:
             {
                 "title": v["snippet"]["title"],
                 "channel": v["snippet"]["channelTitle"],
+                "channel_id": v["snippet"]["channelId"],  # ← added
                 "video_id": v["id"],
                 "comment_count": cc,
                 "view_count": int(v["statistics"].get("viewCount", 0)),
                 "language": v["snippet"].get("defaultAudioLanguage")
                 or v["snippet"].get("defaultLanguage", "untagged"),
+                "published_at": v["snippet"].get("publishedAt"),  # ← added
             }
         )
-    # Preserve the caller-supplied order
     order = {vid: i for i, vid in enumerate(video_ids)}
     stubs.sort(key=lambda x: order.get(x["video_id"], 9999))
     return stubs
@@ -794,7 +804,9 @@ def scrape_video_comments(
                 r_snip = reply["snippet"]
                 r_text = r_snip.get("textDisplay", "")
                 page_total += 1
-                if not FILTER_COMMENTS or (lang_filter and lang_filter.is_nepali(r_text)):
+                if not FILTER_COMMENTS or (
+                    lang_filter and lang_filter.is_nepali(r_text)
+                ):
                     page_comments.append(
                         {
                             "video_id": vid_id,
@@ -872,6 +884,7 @@ def scrape_video_comments(
 # Summary + display
 # ---------------------------------------------------------------------------
 
+
 def save_summary(top_videos: list) -> str:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = os.path.join(OUTPUT_DIR, "summary.json")
@@ -898,6 +911,7 @@ def log_top_videos(top_videos: list) -> None:
 # ---------------------------------------------------------------------------
 # CLI argument parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -930,7 +944,9 @@ def resolve_video_ids(args: argparse.Namespace) -> list[str] | None:
     env_val = os.getenv("VIDEO_IDS", "").strip()
     if env_val:
         ids = [v.strip() for v in env_val.split(",") if v.strip()]
-        log.info("Manual mode: %d video ID(s) supplied via VIDEO_IDS env var.", len(ids))
+        log.info(
+            "Manual mode: %d video ID(s) supplied via VIDEO_IDS env var.", len(ids)
+        )
         return ids
 
     return None
@@ -939,6 +955,7 @@ def resolve_video_ids(args: argparse.Namespace) -> list[str] | None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     args = parse_args()
@@ -962,7 +979,7 @@ def main() -> None:
 
     # Load language filter only when filtering is enabled (saves ~1 GB RAM)
     if FILTER_COMMENTS:
-        lang_filter = NepaliFilter(threshold=LINGUA_CONFIDENCE_THRESHOLD)
+        lang_filter = NepaliFilter(nepali_threshold=LINGUA_CONFIDENCE_THRESHOLD)
     else:
         lang_filter = None
 
@@ -971,10 +988,14 @@ def main() -> None:
     explicit_ids = resolve_video_ids(args)
 
     if explicit_ids:
-        log.info("Fetching video details for %d explicit video ID(s)...", len(explicit_ids))
+        log.info(
+            "Fetching video details for %d explicit video ID(s)...", len(explicit_ids)
+        )
         top_videos = build_video_stubs(youtube, explicit_ids)
         if not top_videos:
-            log.error("Could not retrieve details for any of the supplied video IDs. Exiting.")
+            log.error(
+                "Could not retrieve details for any of the supplied video IDs. Exiting."
+            )
             return
     else:
         log.info("Phase 1: collecting Nepali video IDs...")
